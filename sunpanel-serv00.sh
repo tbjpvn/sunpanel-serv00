@@ -351,15 +351,18 @@ build_version() {
     export GOPATH="$HOME/.cache/gopath" GOCACHE="$HOME/.cache/gobuild" CGO_ENABLED=1
     export PATH="$GOPATH/bin:$PATH"
 
-    # 官方构建流程会用 go-bindata 生成 assets/bindata.go（仓库里没有这个文件）
+    # 官方构建流程会用 go-bindata 生成 assets/bindata.go（仓库里没有这个文件）。
+    # 代码只用到 assets.Asset()，所以直接用 go-bindata 即可，不需要 assetfs 包装工具
+    # （assetfs 在 Serv00 上会报 "bindata.go:2:1: expected 'package'"）。
     if grep -qs 'go-bindata' Dockerfile build.sh 2>/dev/null && [ ! -f "$go_dir/assets/bindata.go" ]; then
         info "生成内置资源 assets/bindata.go（go-bindata）..."
-        ( cd "$HOME" \
-            && go install github.com/go-bindata/go-bindata/...@latest \
-            && go install github.com/elazarl/go-bindata-assetfs/...@latest ) \
+        ( cd "$HOME" && go install github.com/go-bindata/go-bindata/...@latest ) \
             || die "go-bindata 安装失败（网络或 Go 版本问题），未做任何改动"
-        ( cd "$go_dir" && go-bindata-assetfs -o=assets/bindata.go -pkg=assets assets/... ) \
+        command -v go-bindata >/dev/null 2>&1 \
+            || die "go-bindata 已安装但不在 PATH 中（应在 $GOPATH/bin）"
+        ( cd "$go_dir" && go-bindata -o assets/bindata.go -pkg assets assets/... ) \
             || die "生成 bindata.go 失败，未做任何改动"
+        head -n 3 "$go_dir/assets/bindata.go" | sed 's/^/    /'
     fi
 
     ( cd "$go_dir" && go build -o "$BUILD_DIR/sun-panel.bin" \
