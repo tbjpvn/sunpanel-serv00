@@ -184,9 +184,16 @@ choose_port() {
 }
 
 show_ip() {
+    local out web
     echo "服务器 IP（devil vhost list all）："
     if have_devil; then
-        devil vhost list all 2>&1 | sed 's/^/    /'
+        out="$(devil vhost list all 2>&1)"
+        echo "$out" | sed 's/^/    /'
+        web="$(echo "$out" | grep -i 'web' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)"
+        if [ -n "$web" ]; then
+            echo "👉 域名 A 记录应指向 Web IP: $web"
+            echo "   （RevDNS 为 web* 的那个；不要用 s*.serv00.com 或 cache* 的 IP）"
+        fi
     else
         echo "    未检测到 devil 命令，无法查询"
     fi
