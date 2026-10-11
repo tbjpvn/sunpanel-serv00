@@ -24,6 +24,10 @@ ok()   { echo "✅ $*"; }
 warn() { echo "⚠️  $*"; }
 die()  { echo "❌ $*" >&2; exit 1; }
 
+# 菜单配色：终端里显示亮绿色，重定向/非终端时自动不带颜色
+if [ -t 1 ]; then G=$'\033[1;92m'; R=$'\033[0m'; else G=""; R=""; fi
+menu() { echo "${G}$*${R}"; }
+
 # 常见的用户级可执行目录
 export PATH="$HOME/.npm-global/bin:/usr/local/bin:$PATH"
 
@@ -655,12 +659,12 @@ do_watchdog() {
     load_state
     installed || { warn "尚未安装"; return 0; }
     ensure_pm2
-    echo "当前: $(cron_enabled && echo "已开启（每 ${WD_INTERVAL} 分钟）" || echo 未开启)"
-    echo "  1) 开启 / 修改间隔"
-    echo "  2) 关闭守护"
-    echo "  3) 立即检测一次"
-    echo "  4) 查看守护日志"
-    read -r -p "请选择 [1-4]: " c
+    menu "当前: $(cron_enabled && echo "已开启（每 ${WD_INTERVAL} 分钟）" || echo 未开启)"
+    menu "  1) 开启 / 修改间隔"
+    menu "  2) 关闭守护"
+    menu "  3) 立即检测一次"
+    menu "  4) 查看守护日志"
+    read -r -p "${G}请选择 [1-4]: ${R}" c
     case "$c" in
         1) ask_interval; save_state; cron_enable ;;
         2) cron_remove; ok "守护已关闭" ;;
@@ -760,13 +764,13 @@ do_ports() {
     local c
     while true; do
         echo
-        echo "------------- 端口管理 -------------"
+        menu "------------- 端口管理 -------------"
         devil port list 2>&1 | sed 's/^/    /'
         [ -n "$PORT" ] && echo "（Sun-Panel 使用的端口: $PORT）"
-        echo "  1) 增加端口（TCP / UDP）"
-        echo "  2) 删除端口（TCP / UDP）"
-        echo "  0) 返回主菜单"
-        read -r -p "请选择 [0-2]: " c
+        menu "  1) 增加端口（TCP / UDP）"
+        menu "  2) 删除端口（TCP / UDP）"
+        menu "  0) 返回主菜单"
+        read -r -p "${G}请选择 [0-2]: ${R}" c
         case "$c" in
             1) port_add ;;
             2) port_del ;;
@@ -781,21 +785,21 @@ do_ports() {
 # ---------------------------------------------------------------------
 while true; do
     echo
-    echo "=========================================="
-    echo "     Serv00 - Sun-Panel 管理脚本"
-    echo "=========================================="
-    echo "  1) 安装（默认 $INSTALL_TAG）"
-    echo "  2) 升级到最新正式版（自动获取，失败自动回滚）"
-    echo "  3) 卸载"
-    echo "  4) 查看状态"
-    echo "  5) 重启服务"
-    echo "  6) 重置管理员密码"
-    echo "  7) cron 守护（防杀）管理"
-    echo "  8) 绑定 / 更换域名"
-    echo "  9) 查看服务器 IP"
-    echo " 10) 端口管理（增加 / 删除 TCP、UDP 端口）"
-    echo "  0) 退出"
-    read -r -p "请选择 [0-10]: " choice
+    menu "=========================================="
+    menu "     Serv00 - Sun-Panel 管理脚本"
+    menu "=========================================="
+    menu "  1) 安装（默认 $INSTALL_TAG）"
+    menu "  2) 升级到最新正式版（自动获取，失败自动回滚）"
+    menu "  3) 卸载"
+    menu "  4) 查看状态"
+    menu "  5) 重启服务"
+    menu "  6) 重置管理员密码"
+    menu "  7) cron 守护（防杀）管理"
+    menu "  8) 绑定 / 更换域名"
+    menu "  9) 查看服务器 IP"
+    menu " 10) 端口管理（增加 / 删除 TCP、UDP 端口）"
+    menu "  0) 退出"
+    read -r -p "${G}请选择 [0-10]: ${R}" choice
     case "$choice" in
         1) ( do_install ) ;;
         2) ( do_upgrade ) ;;
