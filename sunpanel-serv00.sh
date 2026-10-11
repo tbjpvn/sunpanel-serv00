@@ -3,7 +3,7 @@
 #  Serv00 (FreeBSD) - Sun-Panel 安装 / 升级 / 守护 / 卸载 管理脚本
 #
 #  - 官方没有 FreeBSD 发布包，所以在本机用 Go + Node 从源码编译
-#  - 默认安装 v1.3.0；v1.8.1 只在选择“升级”时才会下载编译
+#  - 默认安装 v1.3.0；升级时自动获取 GitHub 最新正式版再下载编译
 #  - 端口申请、域名绑定、cron 防杀守护，全部在脚本里交互完成，
 #    不需要进 Serv00 面板操作（通过 devil 命令行完成）
 #
@@ -17,7 +17,6 @@ STATE_FILE="$HOME/apps/.sunpanel.env"             # 记录端口/域名/版本�
 BUILD_DIR="$HOME/.sunpanel-build"                 # 临时编译目录
 REPO_URL="https://github.com/hslr-s/sun-panel.git"
 INSTALL_TAG="v1.3.0"                              # 默认安装版本
-UPGRADE_TAG="v1.8.1"                              # 升级默认目标版本
 CRON_MARK="# sun-panel-watchdog"
 
 info() { echo "➜ $*"; }
@@ -477,6 +476,21 @@ do_install() {
     echo "=============================================="
 }
 
+latest_release_tag() {   # 输出 GitHub 最新正式版 tag（不含预发布）
+    local tag
+    tag="$(curl -fsS -m 20 "https://api.github.com/repos/hslr-s/sun-panel/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | head -n1 \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+    if [ -z "$tag" ]; then
+        # 兜底：API 不可用时，从 git tag 里挑最大的 x.y.z 正式版本号
+        tag="$(git ls-remote --tags --refs "$REPO_URL" 2>/dev/null | sed 's|.*refs/tags/||' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' \
+            | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)"
+        [ -n "$tag" ] && tag="v$tag"
+    fi
+    echo "$tag"
+}
+
 # ---------------------------------------------------------------------
 # 2. 升级（失败自动回滚）
 # ---------------------------------------------------------------------
@@ -487,10 +501,19 @@ do_upgrade() {
     ensure_pm2
     need_cmd curl "用于健康检测"
 
-    local target
+    local target latest
     echo "当前版本: ${TAG:-未知}"
-    read -r -p "升级到哪个版本 tag [$UPGRADE_TAG]: " target
-    target="${target:-$UPGRADE_TAG}"
+    info "正在获取最新正式版 ..."
+    latest="$(latest_release_tag)"
+    [ -n "$latest" ] || warn "未能自动获取最新版本号（GitHub 不可达？），可手动输入 tag"
+    echo "最新正式版: ${latest:-未知}"
+    if [ -n "$latest" ] && [ "$latest" = "$TAG" ]; then
+        ok "已经是最新正式版，无需升级"
+        return 0
+    fi
+    read -r -p "升级到哪个版本 tag [${latest:-需手动输入}]（回车=最新正式版）: " target
+    target="${target:-$latest}"
+    [ -n "$target" ] || die "没有可用的目标版本"
     [ "$target" != "$TAG" ] || { warn "已经是 $target，无需升级"; return 0; }
 
     warn "升级会先备份数据；新版本编译成功才会替换，启动失败会自动回滚。"
@@ -662,6 +685,98 @@ do_domain() {
 }
 
 # ---------------------------------------------------------------------
+# 10. 端口管理（增加 / 删除 TCP、UDP 端口）
+# ---------------------------------------------------------------------
+ask_proto() {   # 设置全局 PROTO=tcp|udp
+    local s
+    echo "协议：1) TCP   2) UDP"
+    read -r -p "请选择 [1]: " s
+    case "${s:-1}" in
+        1) PROTO=tcp ;;
+        2) PROTO=udp ;;
+        *) warn "无效选择"; return 1 ;;
+    esac
+}
+
+port_add() {
+    local PROTO p out
+    ask_proto || return 0
+    read -r -p "端口号（1024-65535）；直接回车 = 随机分配: " p
+    if [ -z "$p" ]; then
+        p="random"
+    else
+        case "$p" in *[!0-9]*) warn "端口必须是数字"; return 0 ;; esac
+        if [ "$p" -lt 1024 ] || [ "$p" -gt 65535 ]; then
+            warn "端口范围应为 1024-65535"; return 0
+        fi
+    fi
+    out="$(devil port add "$PROTO" "$p" 2>&1)"
+    echo "$out" | sed 's/^/    /'
+    echo "（若提示额度已满，请先删除不用的同类型端口）"
+}
+
+port_del() {
+    local PROTO p sel i yn
+    local -a ports=()
+    ask_proto || return 0
+    while IFS= read -r p; do
+        [ -n "$p" ] && ports+=("$p")
+    done < <(devil port list 2>/dev/null | grep -i "$PROTO" | grep -oE '[0-9]{4,5}' | sort -un)
+
+    if [ "${#ports[@]}" -eq 0 ]; then
+        warn "没有检测到 $PROTO 端口"
+        return 0
+    fi
+    echo "已有的 $PROTO 端口："
+    i=1
+    for p in "${ports[@]}"; do
+        if [ "$PROTO" = "tcp" ] && [ "$p" = "$PORT" ]; then
+            echo "  $i) $p  (Sun-Panel 正在使用)"
+        else
+            echo "  $i) $p"
+        fi
+        i=$((i + 1))
+    done
+    read -r -p "要删除哪一个？输入编号（回车取消）: " sel
+    [ -n "$sel" ] || { echo "已取消"; return 0; }
+    case "$sel" in *[!0-9]*) warn "无效选择"; return 0 ;; esac
+    if [ "$sel" -lt 1 ] || [ "$sel" -gt "${#ports[@]}" ]; then
+        warn "无效选择"; return 0
+    fi
+    p="${ports[$((sel - 1))]}"
+
+    if [ "$PROTO" = "tcp" ] && [ "$p" = "$PORT" ]; then
+        warn "$p 是 Sun-Panel 正在使用的端口，删除后站点会无法访问！"
+        ask_yn "仍要删除? (y/N):" n || { echo "已取消"; return 0; }
+    else
+        ask_yn "确认删除 $PROTO 端口 $p ? (y/N):" n || { echo "已取消"; return 0; }
+    fi
+    devil port del "$PROTO" "$p" 2>&1 | sed 's/^/    /'
+}
+
+do_ports() {
+    have_devil || { warn "未检测到 devil 命令（可能不是 Serv00），无法管理端口"; return 0; }
+    load_state
+    local c
+    while true; do
+        echo
+        echo "------------- 端口管理 -------------"
+        devil port list 2>&1 | sed 's/^/    /'
+        [ -n "$PORT" ] && echo "（Sun-Panel 使用的端口: $PORT）"
+        echo "  1) 增加端口（TCP / UDP）"
+        echo "  2) 删除端口（TCP / UDP）"
+        echo "  0) 返回主菜单"
+        read -r -p "请选择 [0-2]: " c
+        case "$c" in
+            1) port_add ;;
+            2) port_del ;;
+            0) return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------
 # 菜单
 # ---------------------------------------------------------------------
 while true; do
@@ -670,7 +785,7 @@ while true; do
     echo "     Serv00 - Sun-Panel 管理脚本"
     echo "=========================================="
     echo "  1) 安装（默认 $INSTALL_TAG）"
-    echo "  2) 升级（默认目标 $UPGRADE_TAG，失败自动回滚）"
+    echo "  2) 升级到最新正式版（自动获取，失败自动回滚）"
     echo "  3) 卸载"
     echo "  4) 查看状态"
     echo "  5) 重启服务"
@@ -678,8 +793,9 @@ while true; do
     echo "  7) cron 守护（防杀）管理"
     echo "  8) 绑定 / 更换域名"
     echo "  9) 查看服务器 IP"
+    echo " 10) 端口管理（增加 / 删除 TCP、UDP 端口）"
     echo "  0) 退出"
-    read -r -p "请选择 [0-9]: " choice
+    read -r -p "请选择 [0-10]: " choice
     case "$choice" in
         1) ( do_install ) ;;
         2) ( do_upgrade ) ;;
@@ -690,6 +806,7 @@ while true; do
         7) ( do_watchdog ) ;;
         8) ( do_domain ) ;;
         9) ( show_ip ) ;;
+        10) ( do_ports ) ;;
         0) echo "Bye."; exit 0 ;;
         *) warn "无效选项" ;;
     esac
