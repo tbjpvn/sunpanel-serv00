@@ -105,29 +105,91 @@ wait_up() {  # wait_up 端口 最长秒数
 # ---------------------------------------------------------------------
 # 端口 / 域名（devil）
 # ---------------------------------------------------------------------
+list_tcp_ports() {   # 输出账号已有的 TCP 端口（每行一个）
+    have_devil || return 0
+    local raw ports
+    raw="$(devil port list 2>&1)"
+    ports="$(echo "$raw" | grep -i 'tcp' | grep -oE '[0-9]{4,5}' | sort -un)"
+    # 兜底：输出里没有 tcp 字样时，取所有 4-5 位数字
+    [ -n "$ports" ] || ports="$(echo "$raw" | grep -oE '[0-9]{4,5}' | sort -un)"
+    echo "$ports" | awk '$1>=1024 && $1<=65535'
+}
+
+port_in_use() {   # 端口是否已有本账号进程在监听
+    command -v sockstat >/dev/null 2>&1 || return 1
+    [ "$(sockstat -l -p "$1" 2>/dev/null | wc -l)" -gt 1 ]
+}
+
 choose_port() {
-    local p out
+    local p out raw i sel marker first_free=""
+    local -a ports=()
     echo
     if have_devil; then
-        echo "当前账号已有的端口："
-        devil port list 2>&1 | sed 's/^/    /'
+        raw="$(devil port list 2>&1)"
+        while IFS= read -r p; do
+            [ -n "$p" ] && ports+=("$p")
+        done < <(list_tcp_ports)
     else
         warn "未检测到 devil 命令（可能不是 Serv00），只能手动输入端口"
     fi
-    read -r -p "输入要使用的 TCP 端口；直接回车 = 自动申请一个新端口: " p
+
     PORT_AUTO=0
+    if [ "${#ports[@]}" -gt 0 ]; then
+        echo "检测到账号已有的 TCP 端口："
+        i=1
+        for p in "${ports[@]}"; do
+            marker=""
+            if port_in_use "$p"; then
+                marker="  (已有进程占用)"
+            elif [ -z "$first_free" ]; then
+                first_free="$i"
+            fi
+            echo "  $i) $p$marker"
+            i=$((i + 1))
+        done
+        echo "  a) 自动申请一个新端口"
+        echo "  m) 手动输入端口号"
+        read -r -p "请选择 [默认 ${first_free:-1}]: " sel
+        sel="${sel:-${first_free:-1}}"
+        case "$sel" in
+            a|A) p="" ;;
+            m|M) read -r -p "输入端口号: " p ;;
+            *[!0-9]*) die "无效选择" ;;
+            *)
+                [ "$sel" -ge 1 ] && [ "$sel" -le "${#ports[@]}" ] || die "无效选择"
+                p="${ports[$((sel - 1))]}"
+                ;;
+        esac
+    else
+        if have_devil; then
+            echo "没有解析到已有端口，devil port list 的原始输出如下："
+            echo "$raw" | sed 's/^/    /'
+        fi
+        read -r -p "输入 TCP 端口号；直接回车 = 自动申请新端口: " p
+    fi
+
     if [ -z "$p" ]; then
         have_devil || die "没有 devil 命令，请手动输入端口号"
         out="$(devil port add tcp random 2>&1)"
-        echo "$out"
+        echo "$out" | sed 's/^/    /'
         p="$(echo "$out" | grep -oE '[0-9]{4,5}' | tail -n1)"
-        [ -n "$p" ] || die "自动申请失败（可能 3 个端口额度已满）。请在上面的列表里选一个已有端口再重试"
+        [ -n "$p" ] || die "自动申请失败（3 个端口额度可能已满），请重新运行并选择一个已有端口"
         PORT_AUTO=1
         ok "已申请端口 $p"
     fi
     case "$p" in ''|*[!0-9]*) die "端口必须是数字" ;; esac
     [ "$p" -ge 1024 ] && [ "$p" -le 65535 ] || die "端口范围应为 1024-65535"
     PORT="$p"
+    ok "使用端口 $PORT"
+}
+
+show_ip() {
+    echo "服务器 IP（devil vhost list all）："
+    if have_devil; then
+        devil vhost list all 2>&1 | sed 's/^/    /'
+    else
+        echo "    未检测到 devil 命令，无法查询"
+    fi
 }
 
 bind_domain() {   # 使用全局 DOMAIN / PORT
@@ -144,7 +206,8 @@ bind_domain() {   # 使用全局 DOMAIN / PORT
     if devil www add "$DOMAIN" proxy localhost "$PORT" 2>&1 | sed 's/^/    /'; then
         DOMAIN_ADDED=1
         ok "已绑定 $DOMAIN -> localhost:$PORT"
-        echo "   提示：请把 $DOMAIN 的 DNS A 记录指向 Serv00 的 IP（devil vhost list 可查看）"
+        echo "   提示：请把 $DOMAIN 的 DNS A 记录指向下面的 Serv00 IP"
+        show_ip
         return 0
     fi
     return 1
@@ -268,7 +331,11 @@ build_version() {
     gomain="$(find . -name main.go -not -path '*/node_modules/*' | head -n1)"
     [ -n "$gomain" ] || die "$tag 的源码中没找到 main.go（源码可能不完整），未做任何改动"
     go_dir="$(dirname "$gomain")"
-    pkg="$(find . -maxdepth 2 -name package.json -not -path '*/node_modules/*' | head -n1)"
+    if [ -f ./package.json ]; then
+        pkg="./package.json"
+    else
+        pkg="$(find . -maxdepth 2 -name package.json -not -path '*/node_modules/*' | head -n1)"
+    fi
     [ -n "$pkg" ] || die "$tag 的源码中没找到前端 package.json（源码可能不完整），未做任何改动"
     front_dir="$(dirname "$pkg")"
     info "后端目录: $go_dir   前端目录: $front_dir"
@@ -279,10 +346,25 @@ build_version() {
     [ -f "$front_dir/dist/index.html" ] || die "前端产物 dist/index.html 不存在，未做任何改动"
 
     info "编译后端 ..."
-    export GOPATH="$HOME/.cache/gopath" GOCACHE="$HOME/.cache/gobuild"
+    command -v cc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
+        || die "没有 C 编译器（sqlite 需要 CGO），无法编译后端"
+    export GOPATH="$HOME/.cache/gopath" GOCACHE="$HOME/.cache/gobuild" CGO_ENABLED=1
+    export PATH="$GOPATH/bin:$PATH"
+
+    # 官方构建流程会用 go-bindata 生成 assets/bindata.go（仓库里没有这个文件）
+    if grep -qs 'go-bindata' Dockerfile build.sh 2>/dev/null && [ ! -f "$go_dir/assets/bindata.go" ]; then
+        info "生成内置资源 assets/bindata.go（go-bindata）..."
+        ( cd "$HOME" \
+            && go install github.com/go-bindata/go-bindata/...@latest \
+            && go install github.com/elazarl/go-bindata-assetfs/...@latest ) \
+            || die "go-bindata 安装失败（网络或 Go 版本问题），未做任何改动"
+        ( cd "$go_dir" && go-bindata-assetfs -o=assets/bindata.go -pkg=assets assets/... ) \
+            || die "生成 bindata.go 失败，未做任何改动"
+    fi
+
     ( cd "$go_dir" && go build -o "$BUILD_DIR/sun-panel.bin" \
         -ldflags "-X sun-panel/global.RUNCODE=release" . ) \
-        || die "Go 编译失败（可能 Go 版本低于 go.mod 要求），未做任何改动"
+        || die "Go 编译失败（上面是具体报错），未做任何改动"
 
     rm -rf "$BUILD_DIR/web"
     cp -R "$front_dir/dist" "$BUILD_DIR/web"
@@ -380,6 +462,7 @@ do_install() {
     ok "安装完成（版本 $TAG）"
     [ -n "$DOMAIN" ] && echo "访问地址: http://$DOMAIN"
     [ -z "$DOMAIN" ] && echo "还没绑定域名：用菜单“绑定域名”即可，无需进面板"
+    show_ip
     echo "默认账号: admin@sun.cc   默认密码: 12345678   —— 登录后请立刻修改"
     echo "=============================================="
 }
@@ -584,8 +667,9 @@ while true; do
     echo "  6) 重置管理员密码"
     echo "  7) cron 守护（防杀）管理"
     echo "  8) 绑定 / 更换域名"
+    echo "  9) 查看服务器 IP"
     echo "  0) 退出"
-    read -r -p "请选择 [0-8]: " choice
+    read -r -p "请选择 [0-9]: " choice
     case "$choice" in
         1) ( do_install ) ;;
         2) ( do_upgrade ) ;;
@@ -595,6 +679,7 @@ while true; do
         6) ( do_reset_pw ) ;;
         7) ( do_watchdog ) ;;
         8) ( do_domain ) ;;
+        9) ( show_ip ) ;;
         0) echo "Bye."; exit 0 ;;
         *) warn "无效选项" ;;
     esac
