@@ -48,7 +48,7 @@ have_devil() { command -v devil >/dev/null 2>&1; }
 # 状态文件
 # ---------------------------------------------------------------------
 load_state() {
-    DOMAIN=""; PORT=""; TAG=""; PORT_AUTO=0; DOMAIN_ADDED=0; WD_INTERVAL=5
+    DOMAIN=""; PORT=""; TAG=""; SRC_VER=""; PORT_AUTO=0; DOMAIN_ADDED=0; WD_INTERVAL=5
     # shellcheck disable=SC1090
     [ -f "$STATE_FILE" ] && . "$STATE_FILE"
     return 0
@@ -60,6 +60,7 @@ save_state() {
 DOMAIN="$DOMAIN"
 PORT="$PORT"
 TAG="$TAG"
+SRC_VER="$SRC_VER"
 PORT_AUTO="$PORT_AUTO"
 DOMAIN_ADDED="$DOMAIN_ADDED"
 WD_INTERVAL="$WD_INTERVAL"
@@ -350,6 +351,14 @@ build_version() {
     front_dir="$(dirname "$pkg")"
     info "后端目录: $go_dir   前端目录: $front_dir"
 
+    # 源码内部版本号（service/assets/version，格式 "10|1.3.0"）
+    NEW_SRC_VER="$(cut -d'|' -f2 "$go_dir/assets/version" 2>/dev/null | tr -d '[:space:]')"
+    info "该 tag 的源码内部版本: ${NEW_SRC_VER:-未知}"
+    if [ -n "${REQUIRE_NEWER_THAN:-}" ] && [ "$NEW_SRC_VER" = "$REQUIRE_NEWER_THAN" ]; then
+        rm -rf "$BUILD_DIR"
+        die "$tag 的源码仍是 $NEW_SRC_VER，和当前运行的代码完全一样，编译不会得到新功能，已停止（未做任何改动）"
+    fi
+
     info "编译前端（可能需要几分钟）..."
     ( cd "$front_dir" && npm install --no-audit --no-fund && npm run build ) \
         || die "前端编译失败（常见原因：内存/进程数受限、Node 版本过低），未做任何改动"
@@ -451,6 +460,7 @@ do_install() {
 
     write_port_conf
     TAG="$INSTALL_TAG"
+    SRC_VER="$NEW_SRC_VER"
     save_state
 
     pm2_start || die "pm2 启动失败"
@@ -506,7 +516,9 @@ do_upgrade() {
     need_cmd curl "用于健康检测"
 
     local target latest
-    echo "当前版本: ${TAG:-未知}"
+    echo "当前版本: ${TAG:-未知}（源码内部版本 ${SRC_VER:-1.3.0}）"
+    warn "注意：官方 v1.4.0 之后的正式版是闭源的，只发布 Linux/Windows 二进制，"
+    warn "仓库里的 v1.4.0~v1.8.1 tag 实际仍是 1.3.0 的源码。脚本会先检查，源码没变就不会重复编译。"
     info "正在获取最新正式版 ..."
     latest="$(latest_release_tag)"
     [ -n "$latest" ] || warn "未能自动获取最新版本号（GitHub 不可达？），可手动输入 tag"
@@ -523,9 +535,9 @@ do_upgrade() {
     warn "升级会先备份数据；新版本编译成功才会替换，启动失败会自动回滚。"
     ask_yn "继续? (y/N):" n || { echo "已取消"; return 0; }
 
+    REQUIRE_NEWER_THAN="${SRC_VER:-1.3.0}"
+    build_version "$target"   # 源码没有新版本时会在这里直接停止，不会备份/替换
     backup_data
-
-    build_version "$target"
 
     touch "$APP_DIR/.upgrading"
     trap 'rm -f "$APP_DIR/.upgrading"' EXIT
@@ -542,6 +554,7 @@ do_upgrade() {
     if wait_up "$PORT" 25; then
         rm -rf "$APP_DIR/sun-panel.old" "$APP_DIR/web.old"
         TAG="$target"
+        SRC_VER="$NEW_SRC_VER"
         save_state
         rm -rf "$BUILD_DIR"
         ok "升级成功，当前版本 $TAG"
@@ -789,7 +802,7 @@ while true; do
     menu "     Serv00 - Sun-Panel 管理脚本"
     menu "=========================================="
     menu "  1) 安装（默认 $INSTALL_TAG）"
-    menu "  2) 升级到最新正式版（自动获取，失败自动回滚）"
+    menu "  2) 升级（仅当源码有新版本时有效，失败自动回滚）"
     menu "  3) 卸载"
     menu "  4) 查看状态"
     menu "  5) 重启服务"
