@@ -575,6 +575,48 @@ do_upgrade() {
     fi
 }
 
+# 卸载时清理编译留下的缓存、脚本装的 pm2、备份文件（都会占 Serv00 的磁盘配额）
+uninstall_extras() {
+    local gp="$HOME/.cache/gopath" gb="$HOME/.cache/gobuild" backups n
+    # 1) 编译缓存：Go 模块缓存是只读目录，必须先加写权限才能删干净
+    if [ -d "$gp" ] || [ -d "$gb" ] || [ -d "$HOME/.npm/_cacache" ]; then
+        echo "发现编译缓存：Go 模块缓存($gp)、Go 构建缓存($gb)、npm 缓存(~/.npm)"
+        if ask_yn "清理这些缓存释放磁盘空间（只是缓存，不影响其他程序运行）? (Y/n):" y; then
+            [ -d "$gp" ] && chmod -R u+w "$gp" 2>/dev/null
+            rm -rf "$gp" "$gb"
+            command -v npm >/dev/null 2>&1 && npm cache clean --force >/dev/null 2>&1
+            ok "编译缓存已清理"
+        fi
+    fi
+    # 2) pm2：只有它装在 ~/.npm-global 且没有别的进程在用时才询问
+    if [ -x "$HOME/.npm-global/bin/pm2" ]; then
+        if [ "$("$HOME/.npm-global/bin/pm2" jlist 2>/dev/null | grep -c '"name"')" = "0" ]; then
+            if ask_yn "pm2 里已经没有其他进程，同时卸载本脚本装的 pm2 和 ~/.pm2 ? (y/N):" n; then
+                "$HOME/.npm-global/bin/pm2" kill >/dev/null 2>&1
+                npm uninstall -g pm2 --prefix "$HOME/.npm-global" >/dev/null 2>&1
+                rm -rf "$HOME/.pm2"
+                rmdir "$HOME/.npm-global/bin" "$HOME/.npm-global/lib/node_modules" "$HOME/.npm-global/lib" "$HOME/.npm-global" 2>/dev/null
+                ok "pm2 已卸载"
+            fi
+        else
+            echo "pm2 里还有其他进程在运行，保留 pm2"
+        fi
+    fi
+    # 3) 备份文件
+    backups="$(ls "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)"
+    if [ -n "$backups" ]; then
+        n="$(echo "$backups" | wc -l | tr -d ' ')"
+        echo "$HOME 下有 $n 个本脚本生成的备份："
+        echo "$backups" | sed 's/^/    /'
+        if ask_yn "同时删除这些备份? 删除后无法恢复 (y/N):" n; then
+            rm -f "$HOME"/sun-panel-backup-*.tar.gz
+            ok "备份已删除"
+        else
+            echo "备份已保留"
+        fi
+    fi
+}
+
 # ---------------------------------------------------------------------
 # 3. 卸载
 # ---------------------------------------------------------------------
@@ -598,6 +640,7 @@ do_uninstall() {
     cron_remove
     rm -rf "$APP_DIR" "$BUILD_DIR"
     ok "本地进程、守护、文件已清理"
+    uninstall_extras
 
     if have_devil; then
         if [ -n "$DOMAIN" ]; then
@@ -621,6 +664,7 @@ do_uninstall() {
         [ -n "$PORT" ]   && echo "请手动释放端口: $PORT"
     fi
     rm -f "$STATE_FILE"
+    rmdir "$(dirname "$STATE_FILE")" "$HOME/.cache" 2>/dev/null   # 只在目录已空时才会删，不会误删别的东西
     ok "卸载完成"
 }
 
