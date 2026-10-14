@@ -25,8 +25,9 @@ warn() { echo "⚠️  $*"; }
 die()  { echo "❌ $*" >&2; exit 1; }
 
 # 菜单配色：终端里显示亮绿色，重定向/非终端时自动不带颜色
-if [ -t 1 ]; then G=$'\033[1;92m'; R=$'\033[0m'; else G=""; R=""; fi
+if [ -t 1 ]; then G=$'\033[1;92m'; RD=$'\033[1;91m'; R=$'\033[0m'; else G=""; RD=""; R=""; fi
 menu() { echo "${G}$*${R}"; }
+menu_red() { echo "${RD}$*${R}"; }
 
 # 常见的用户级可执行目录
 export PATH="$HOME/.npm-global/bin:/usr/local/bin:$PATH"
@@ -51,6 +52,11 @@ load_state() {
     DOMAIN=""; PORT=""; TAG=""; SRC_VER=""; PORT_AUTO=0; DOMAIN_ADDED=0; WD_INTERVAL=5
     # shellcheck disable=SC1090
     [ -f "$STATE_FILE" ] && . "$STATE_FILE"
+    # 显示的版本以实际运行的源码为准（早期脚本可能把 TAG 误记成 v1.8.1，实际仍是 1.3.0 的代码）
+    if [ -n "$SRC_VER" ] && [ "$TAG" != "v$SRC_VER" ]; then
+        TAG="v$SRC_VER"
+        [ -f "$STATE_FILE" ] && save_state
+    fi
     return 0
 }
 
@@ -414,17 +420,23 @@ write_port_conf() {   # 在 APP_DIR 下，把 PORT 写进 conf/conf.ini
     fi
 }
 
-backup_data() {   # 备份 conf/database/uploads，输出文件路径到 BACKUP_FILE
-    local files="" d
+backup_data() {   # 备份 conf/database/uploads 到 ~/sun-panel-backup.tar.gz（只保留最新一份）
+    local files="" d tmp
     BACKUP_FILE=""
     for d in conf database uploads; do
         [ -e "$APP_DIR/$d" ] && files="$files $d"
     done
     [ -n "$files" ] || return 0
-    BACKUP_FILE="$HOME/sun-panel-backup-$(date +%Y%m%d%H%M%S).tar.gz"
+    tmp="$HOME/sun-panel-backup.tar.gz.tmp"
     # shellcheck disable=SC2086
-    tar -czf "$BACKUP_FILE" -C "$APP_DIR" $files && ok "数据已备份: $BACKUP_FILE" \
-        || { warn "备份失败"; BACKUP_FILE=""; return 1; }
+    if tar -czf "$tmp" -C "$APP_DIR" $files; then
+        rm -f "$HOME"/sun-panel-backup-*.tar.gz          # 清理旧版脚本留下的带时间戳备份
+        mv -f "$tmp" "$HOME/sun-panel-backup.tar.gz"
+        BACKUP_FILE="$HOME/sun-panel-backup.tar.gz"
+        ok "数据已备份（覆盖旧备份）: $BACKUP_FILE"
+    else
+        rm -f "$tmp"; warn "备份失败（旧备份保持不变）"; return 1
+    fi
 }
 
 # ---------------------------------------------------------------------
@@ -515,17 +527,22 @@ do_upgrade() {
     ensure_pm2
     need_cmd curl "用于健康检测"
 
-    local target latest
+    local target latest latest_src
     echo "当前版本: ${TAG:-未知}（源码内部版本 ${SRC_VER:-1.3.0}）"
-    warn "注意：官方 v1.4.0 之后的正式版是闭源的，只发布 Linux/Windows 二进制，"
-    warn "仓库里的 v1.4.0~v1.8.1 tag 实际仍是 1.3.0 的源码。脚本会先检查，源码没变就不会重复编译。"
     info "正在获取最新正式版 ..."
     latest="$(latest_release_tag)"
     [ -n "$latest" ] || warn "未能自动获取最新版本号（GitHub 不可达？），可手动输入 tag"
-    echo "最新正式版: ${latest:-未知}"
-    if [ -n "$latest" ] && [ "$latest" = "$TAG" ]; then
-        ok "已经是最新正式版，无需升级"
-        return 0
+    if [ -n "$latest" ]; then
+        # 先只读取该 tag 的版本文件，判断源码有没有真的更新（不克隆、不编译）
+        latest_src="$(curl -fsS -m 15 "https://raw.githubusercontent.com/hslr-s/sun-panel/$latest/service/assets/version" 2>/dev/null \
+            | cut -d'|' -f2 | tr -d '[:space:]')"
+        if [ -n "$latest_src" ] && [ "$latest_src" = "${SRC_VER:-1.3.0}" ]; then
+            echo "官方最新正式版: $latest（闭源，仓库里只有 $latest_src 的源码）"
+            ok "Serv00 能编译的开源代码最高就是 v$latest_src，你当前已是最新，保持 ${TAG:-v1.3.0}"
+            echo "想用 1.4 以后的新功能，需要 Linux VPS 的 Docker 版（sunpanel-vps.sh）。"
+            return 0
+        fi
+        echo "最新正式版: $latest"
     fi
     read -r -p "升级到哪个版本 tag [${latest:-需手动输入}]（回车=最新正式版）: " target
     target="${target:-$latest}"
@@ -603,13 +620,13 @@ uninstall_extras() {
         fi
     fi
     # 3) 备份文件
-    backups="$(ls "$HOME"/sun-panel-backup-*.tar.gz 2>/dev/null)"
+    backups="$(ls "$HOME"/sun-panel-backup*.tar.gz 2>/dev/null)"
     if [ -n "$backups" ]; then
         n="$(echo "$backups" | wc -l | tr -d ' ')"
         echo "$HOME 下有 $n 个本脚本生成的备份："
         echo "$backups" | sed 's/^/    /'
         if ask_yn "同时删除这些备份? 删除后无法恢复 (y/N):" n; then
-            rm -f "$HOME"/sun-panel-backup-*.tar.gz
+            rm -f "$HOME"/sun-panel-backup*.tar.gz
             ok "备份已删除"
         else
             echo "备份已保留"
@@ -847,7 +864,7 @@ while true; do
     menu "=========================================="
     menu "  1) 安装（默认 $INSTALL_TAG）"
     menu "  2) 升级（仅当源码有新版本时有效，失败自动回滚）"
-    menu "  3) 卸载"
+    menu_red "  3) 卸载"
     menu "  4) 查看状态"
     menu "  5) 重启服务"
     menu "  6) 重置管理员密码"
